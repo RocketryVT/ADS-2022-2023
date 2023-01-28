@@ -1,6 +1,6 @@
 import adafruit_mpl3115a2
 from adafruit_lsm6ds.lsm6dsox import LSM6DSOX
-import adafruit_bno055
+# import adafruit_bno055
 import Adafruit_BBIO.PWM as PWM
 import time
 import board
@@ -18,7 +18,7 @@ class Vehicle_Status(Enum):
 ##################################
 ## launch day software checklist
 pad_pressure = 102250
-launch_date = "05-19-2022"
+launch_date = "10-29-2022"
 # servo pin check
 servoPin = "P8_13"
 # switch to true for SD storage
@@ -39,6 +39,13 @@ fileName = "DataLog_"+launch_date+".txt"
 
 if not SD:
 	savePath = '/home/debian'
+
+###################################
+ledonePath = '/sys/class/leds/beaglebone:green:usr1'
+ledBrightnessFile = 'brightness'
+
+brightness = 1
+ledGapTime = 0.5
 
 ###################################
 # threshold limits
@@ -66,8 +73,8 @@ allow_angle_limit = 15
 # mpl3115a2 default i2c bus
 MPL_BUS = 0x60
 # imu default i2c bus V3+ uses BNO055
-#LSM_BUS = 0x6a
-LSM_BUS = 0x28
+LSM_BUS = 0x6a
+# LSM_BUS = 0x28
 ###################################
 
 # servo setup parameter 
@@ -91,6 +98,7 @@ def init():
 	global imu
 	global duty_span
 	global file
+	global ledFileName
 	global i2c
 
 	# create sensor object, communicating via default I2C bus
@@ -100,7 +108,7 @@ def init():
 	# construct completed file location
 	completedName = os.path.join(savePath, fileName)
 	# create a new file
-	file = open(completedName, "w")
+	file = open(completedName, "a")
 	# write header on the logger
 	SDwrite("Launch Date: " + launch_date)
 
@@ -116,7 +124,10 @@ def init():
 	## servo setup
 	duty_span = duty_max - duty_min
 	# servo might have a different parity
-	PWM.start(servoPin, (100 - duty_min), 60.0, 1)	
+	PWM.start(servoPin, (100 - duty_min), 60.0, 1)
+
+	## blick the beaglebone LED 1
+	ledFileName = os.path.join(ledonePath, ledBrightnessFile)
 
 	status = Vehicle_Status.ON_PAD
 	return status
@@ -125,8 +136,10 @@ def init():
 ## Data formatting and logging 
 def SDwrite(string):
 
+	global file
+
 	log_time = time.time() - start_time
-	file.write("{0:0.3f}".format(log_time) + ": ")
+	file.write("{0:0.3f}".format(log_time) + ", ")
 	file.write(string + "\n")
 
 
@@ -177,7 +190,7 @@ def imu_set(i2c):
 	global imu_Setup_fail
 
 	try:
-		imu = adafruit_bno055.BNO055_I2C(i2c, address=LSM_BUS)
+		imu = LSM6DSOX(i2c, address=LSM_BUS)
 
 		imu_Setup_fail = False
 		return imu
@@ -218,19 +231,19 @@ def servo_actuate(deployment):
 	PWM.set_duty_cycle(servoPin, duty)
 
 
-def output(altitude, deployment, acceleration, gyro, euler_angle):
+def output(altitude, deployment, acceleration, gyro):
 
 	if (not alti_Setup_fail and not alti_fail):
 
-		SDwrite("	Al: {0:0.3f}".format(altitude)) # (meters)
+		SDwrite("{0:0.5f}".format(altitude)) # (meters)
 
-	SDwrite("	SA: {0:0.2f}".format(deployment)) # (degrees)
+	SDwrite("{0:0.2f}".format(deployment)) # (degrees)
 
 	if (not imu_Setup_fail and not imu_fail):
 
-		SDwrite("	Ac: %.2f %.2f %.2f" % (acceleration)) # X Y Z (m/s^2)
-		SDwrite("	Gy: %.2f %.2f %.2f" % (gyro)) # X Y Z (radians/s)
-		SDwrite("	EA: %.2f %.2f %.2f" % (euler_angle)) # latter two is pitch and yaw
+		SDwrite("%.2f, %.2f, %.2f" % (acceleration)) # X Y Z (m/s^2)
+		SDwrite("%.2f, %.2f, %.2f" % (gyro)) # X Y Z (radians/s)
+		# SDwrite("EA: %.2f %.2f %.2f" % (euler_angle)) # latter two is pitch and yaw
 
 
 # customized based on the mission
@@ -240,6 +253,8 @@ def actuation_plan(status):
 	global deploy_time
 	global altimeter
 	global imu
+
+	atti_fail = False
 
 	deployment = deploy_percentage_to_angle(0)
 	
@@ -267,8 +282,6 @@ def actuation_plan(status):
 
 			deploy_time = time.time()
 
-		print(deploy_time)
-
 	else:
 		
 		if alti_fail:
@@ -291,10 +304,13 @@ def main():
 	global altimeter
 	global imu
 	global file
+	global ledFileName
+	global brightness
 
 	start_time = time.time()
 	fail_time = start_time
 	relog_time = start_time
+	led_time = start_time
 
 	try:
 		status = init()
@@ -326,7 +342,7 @@ def main():
 	acceleration = (0,0,0)
 	gyro = (0,0,0)
 	z_a = 0
-	euler_angle = (0,0,0)
+	# euler_angle = (0,0,0)
 	imu_fail = False
 
 	deployment = deploy_percentage_to_angle(INIT_DEPLOYMENT)
@@ -341,7 +357,7 @@ def main():
 				acceleration = imu.acceleration
 				z_a = acceleration[2]
 				gyro = imu.gyro
-				euler_angle = imu.euler
+				# euler_angle = imu.euler
 
 				imu_fail = False
 
@@ -382,6 +398,17 @@ def main():
 				# reset initial deployment
 				deployment = deploy_percentage_to_angle(INIT_DEPLOYMENT)
 
+				# relogging detection every 25 minutes
+				if time.time() - relog_time > 25 * 60 and status is Vehicle_Status.ON_PAD:
+
+					file.close()
+					completedName = os.path.join(savePath, fileName)
+					os.remove(completedName)
+					file = open(completedName, "w")
+					relog_time = time.time()
+					print("file overwritten success")
+				
+
 			elif status is Vehicle_Status.BOOST:
 
 				if (z_a <= glide_a_threshold * g0 or time.time() - liftoff_time >= time_bo):
@@ -400,13 +427,14 @@ def main():
 					status = Vehicle_Status.DONE
 					break
 
-			attitude_safe(euler_angle)
+			# attitude_safe(euler_angle)
 			deployment = actuation_plan(status)
 		
 		else:
 
-			if (time.time() - fail_time >= time_end):
+			if time.time() - fail_time >= time_end:
 				status = Vehicle_Status.DONE
+				break
 
 			if alti_fail or alti_Setup_fail:
 				altimeter = altimeter_set(i2c)
@@ -420,16 +448,16 @@ def main():
 
 		servo_actuate(deployment)
 
-		# relogging detection every 25 minutes
-		if time.time() - relog_time > 25 * 60 and status is Vehicle_Status.ON_PAD:
+		# output(altitude, deployment, acceleration, gyro, euler_angle)
+		output(altitude, deployment, acceleration, gyro)
 
-			file.close()
-			completedName = os.path.join(savePath, fileName)
-			os.remove(completedName)
-			file = open(completedName, "w")
-			relog_time = time.time()
+		if time.time() - led_time > ledGapTime:
+			ledFile = open(ledFileName, "w")
+			ledFile.write(str(brightness))
 
-		output(altitude, deployment, acceleration, gyro, euler_angle)
+			led_time = time.time()
+			ledFile.close()
+			brightness = (brightness + 1) % 2
 
 		time.sleep(0.1)
 
